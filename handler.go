@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
+	"os"
 	"strings"
 
 	"time"
@@ -33,14 +33,12 @@ func (r *streamReader) Read(p []byte) (n int, err error) {
 
 func handleSearch(query string, language string, c *fiber.Ctx) error {
 
-	start := time.Now()
-
 	punctuations := "!?,.;:-'\" "
 
 	// Create a Redis client
 	redisClient := redis.NewClient(&redis.Options{
-		Addr:        "redis-16412.c114.us-east-1-4.ec2.cloud.redislabs.com:16412",
-		Password:    "t7BABOe7BLOde7dU6mQB2u52ksG5QJDl",
+		Addr:        os.Getenv("REDIS_HOST"),
+		Password:    os.Getenv("REDIS_PASSWORD"),
 		DB:          0,
 		PoolSize:    10,
 		PoolTimeout: 30 * time.Second,
@@ -53,7 +51,7 @@ func handleSearch(query string, language string, c *fiber.Ctx) error {
 		return c.SendString(cachedResponse)
 	} else if err != redis.Nil {
 		// An error occurred while getting the value from Redis
-		fmt.Println(err)
+		log.Println(err)
 	}
 
 	// Query is not cached or an error occurred, fetch response from APIs
@@ -66,9 +64,9 @@ func handleSearch(query string, language string, c *fiber.Ctx) error {
 
 	// Call the Bing API to get snippets concurrently and stream them to the snippets channel
 	go func() {
-		searchResults, err := search.GetBingResponse(query)
+		searchResults, err := search.GetBingResponse(query, c)
 		if err != nil {
-			fmt.Println(err)
+			log.Println(err)
 			// return
 		}
 		resultsChannel <- searchResults
@@ -85,7 +83,7 @@ func handleSearch(query string, language string, c *fiber.Ctx) error {
 	// Call the OpenAI API to generate a response
 	messageStream, err := search.GenerateOpenAIResponse(snippetsChannel, query, language)
 	if err != nil {
-		return c.SendString("Error: " + err.Error() + "\n")
+		return c.SendString("Error: Generating Response please refresh try again")
 	}
 
 	// Set response headers
@@ -111,9 +109,6 @@ func handleSearch(query string, language string, c *fiber.Ctx) error {
 
 	}()
 
-	startOpenAIStream := time.Since(start)
-	fmt.Println("OpenAI Stream: ", startOpenAIStream)
-
 	c.SendStream(&streamReader{byteStream})
 
 	bingResults := <-resultsChannel
@@ -134,8 +129,8 @@ func saveSearchResults(query string, language string, c *fiber.Ctx) error {
 
 	// Create a Redis client
 	redisClient := redis.NewClient(&redis.Options{
-		Addr:        "redis-16412.c114.us-east-1-4.ec2.cloud.redislabs.com:16412",
-		Password:    "t7BABOe7BLOde7dU6mQB2u52ksG5QJDl",
+		Addr:        os.Getenv("REDIS_HOST"),
+		Password:    os.Getenv("REDIS_PASSWORD"),
 		DB:          0,
 		PoolSize:    10,
 		PoolTimeout: 30 * time.Second,

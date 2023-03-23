@@ -6,9 +6,15 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"strings"
+	"time"
 
+	"github.com/gofiber/fiber/v2"
+	"github.com/redis/go-redis/v9"
 	openai "github.com/sashabaranov/go-openai"
 )
 
@@ -29,15 +35,14 @@ type SearchResult struct {
 }
 
 // Call the Bing API to get snippets
-
-func GetBingResponse(query string) ([]SearchResult, error) {
+func GetBingResponse(query string, c *fiber.Ctx) ([]SearchResult, error) {
 
 	// Define the Bing API endpoint and parameters
-	endpoint := "https://api.bing.microsoft.com/v7.0/search?"
+	endpoint := os.Getenv("BING_ENDPOINT")
 	count := "10"
 	offset := "0"
 	mkt := "en-US"
-	apiKey := "33dde677bea54423be1d204f3432e34a"
+	apiKey := os.Getenv("BING_API_KEY")
 
 	// Create a URL object with the query parameters
 	apiUrl, err := url.Parse(endpoint)
@@ -103,6 +108,8 @@ func GetBingResponse(query string) ([]SearchResult, error) {
 		searchResults = append(searchResults, result)
 	}
 
+	c.JSON(searchResults)
+
 	return searchResults, nil
 }
 
@@ -128,7 +135,7 @@ func GenerateOpenAIResponse(snippetsChannel <-chan string, query string, languag
 	systemRole := "You are a search engine. Your job is to provide users with a concise and useful response."
 
 	// Call the OpenAI API to generate a response
-	openAIClient := openai.NewClient("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")
+	openAIClient := openai.NewClient(os.Getenv("OPENAI_API_KEY"))
 	stream, err := openAIClient.CreateChatCompletionStream(
 		context.Background(),
 
@@ -175,4 +182,80 @@ func GenerateOpenAIResponse(snippetsChannel <-chan string, query string, languag
 	}()
 
 	return messageStream, nil
+}
+
+func GenerateRelatedQuestions(finalResponse string, query string, language string, c *fiber.Ctx) error {
+
+	// Create the prompt with the summarized snippets
+	prompt := "Search query: " +
+		query +
+		"\n\n Extractive Summary: " +
+		finalResponse +
+		"\n\nTask: \n" +
+		os.Getenv("TASK")
+
+	systemRole := os.Getenv("SYSTEM_ROLE")
+	// Call the OpenAI API to generate a response
+	openAIClient := openai.NewClient(os.Getenv("OPENAI_API_KEY"))
+	resp, err := openAIClient.CreateChatCompletion(
+		context.Background(),
+
+		openai.ChatCompletionRequest{
+			Model: openai.GPT3Dot5Turbo,
+			Messages: []openai.ChatCompletionMessage{
+				{
+					Role:    openai.ChatMessageRoleSystem,
+					Content: systemRole,
+				},
+				{
+					Role:    openai.ChatMessageRoleUser,
+					Content: prompt,
+				},
+			},
+			Temperature:      0.3,
+			TopP:             1.0,
+			FrequencyPenalty: 0.0,
+			PresencePenalty:  0.0,
+			MaxTokens:        150,
+		},
+	)
+
+	if err != nil {
+		return err
+	}
+
+	// Create a Redis client
+	redisClient := redis.NewClient(&redis.Options{
+		Addr:        os.Getenv("REDIS_HOST"),
+		Password:    os.Getenv("REDIS_PASSWORD"),
+		DB:          0,
+		PoolSize:    10,
+		PoolTimeout: 30 * time.Second,
+	})
+
+	punctuations := "!?,.;:-'\" "
+
+	// Set the cache duration to 3 hours (10800 seconds)
+	cacheDuration := time.Duration(10800) * time.Second
+
+	// Check if query is cached in Redis
+	cachedResponse, err := redisClient.Get(context.Background(), language+" : "+strings.ToLower(strings.TrimSpace(strings.Trim(query, punctuations)))+" : relatedQuestions").Result()
+	if err == nil {
+		// Query is cached, use cached response
+		return c.SendString(cachedResponse)
+	} else if err != redis.Nil {
+		// An error occurred while getting the value from Redis
+		log.Println(err)
+	}
+
+	relatedQuestions := resp.Choices[0].Message.Content
+	c.SendString(relatedQuestions)
+
+	// Store the search results in Redis cache
+	err = redisClient.Set(context.Background(), language+" : "+strings.ToLower(strings.TrimSpace(strings.Trim(query, punctuations)))+" : relatedQuestions", relatedQuestions, cacheDuration).Err()
+	if err != nil {
+		log.Print("Error: Unkown")
+	}
+
+	return nil
 }
